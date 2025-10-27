@@ -1,0 +1,116 @@
+'use client';
+
+import {
+  collection,
+  doc,
+  setDoc,
+  Firestore,
+  serverTimestamp,
+} from 'firebase/firestore';
+import type { User } from 'firebase/auth';
+import { errorEmitter } from '@/firebase/error-emitter';
+import { FirestorePermissionError } from '@/firebase/errors';
+import type { EncodedImage } from '@/lib/types';
+import { getStorage } from 'firebase/storage';
+
+const delay = (ms: number) => new Promise(res => setTimeout(res, ms));
+
+/**
+ * Creates or updates a user's profile in Firestore.
+ * @param firestore The Firestore instance.
+ * @param user The Firebase Auth user object.
+ */
+export async function upsertUserProfile(firestore: Firestore, user: User) {
+    const userRef = doc(firestore, `users/${user.uid}`);
+    try {
+        const userData = {
+            id: user.uid,
+            email: user.email,
+            displayName: user.displayName,
+            photoURL: user.photoURL,
+            createdAt: serverTimestamp(),
+        };
+        // Use setDoc with merge:true to create or update the document
+        await setDoc(userRef, userData, { merge: true });
+    } catch (error: any) {
+        console.error("Error upserting user profile:", error);
+        // We don't need to throw a permission error here as it's a background task
+    }
+}
+
+
+/**
+ * Saves encoded image metadata to Firestore.
+ * Does NOT upload images to Firebase Storage.
+ * @param firestore - The Firestore instance.
+ * @param userId - The ID of the user.
+ * @param imageData - The metadata for the encoded image.
+ * @param logCallback - A function to call with progress updates.
+ */
+export async function saveEncodedImage(
+    firestore: Firestore,
+    userId: string,
+    imageData: Omit<EncodedImage, 'id' | 'encodingDateTime' | 'carrierImageStoragePath'>,
+    logCallback: (message: string, status?: 'pending' | 'complete' | 'error') => void
+): Promise<void> {
+    
+    // Generate a unique ID locally for the new document
+    const imageId = doc(collection(firestore, 'tmp')).id;
+    
+    try {
+        logCallback('Initiating process...');
+        await delay(300);
+
+        const imageRef = doc(firestore, `users/${userId}/encodedImages`, imageId);
+        logCallback('Generated unique ID for metadata record.');
+        await delay(400);
+
+        const newImageData: EncodedImage = {
+            ...imageData,
+            id: imageRef.id,
+            userId: userId,
+            encodingDateTime: serverTimestamp() as any,
+            carrierImageStoragePath: '', // No longer storing in Firebase Storage
+        };
+        logCallback('Prepared image metadata object.');
+        await delay(300);
+        
+        logCallback('Connecting to Firestore database...');
+        await delay(500);
+
+        // Save the metadata to Firestore
+        logCallback(`Sending data to your secure collection...`);
+        setDoc(imageRef, newImageData).catch(async (serverError) => {
+             const permissionError = new FirestorePermissionError({
+                path: imageRef.path,
+                operation: 'create',
+                requestResourceData: newImageData,
+            });
+             errorEmitter.emit('permission-error', permissionError);
+        });
+
+        logCallback('Waiting for confirmation from Firestore...', 'pending');
+        await delay(600); // Simulate waiting for write confirmation
+
+        logCallback('Metadata saved successfully.', 'complete');
+
+    } catch (error: any) {
+        console.error("Error in saveEncodedImage:", error);
+        
+        const errorMessage = error.code ? `[${error.code}] ${error.message}` : error.message;
+        
+        logCallback(errorMessage, 'error');
+
+        const permissionError = new FirestorePermissionError({
+            path: `users/${userId}/encodedImages/${imageId}`,
+            operation: 'create',
+            requestResourceData: imageData
+        });
+        
+        // Emit the structured error for dev overlay
+        errorEmitter.emit('permission-error', permissionError);
+        
+        // Re-throw the error so the calling component can handle the UI state (e.g., stop loading spinner)
+        throw new Error(errorMessage);
+    }
+}
